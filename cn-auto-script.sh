@@ -11,35 +11,45 @@ regions=(
 )
 
 # Output directory
-output_dir="/home/roccoren/azcharts"
+output_dir="."
 
 # Storage details
 storage_account="azchartscn"
 container_name="china"
 
-# Power Automate webhook URL
-power_automate_url="https://prod-27.westus3.logic.azure.com:443/workflows/96e9b10466814fcc8b470df3074dafda/triggers/When_a_HTTP_request_is_received/paths/invoke?api-version=2016-10-01&sp=%2Ftriggers%2FWhen_a_HTTP_request_is_received%2Frun&sv=1.0&sig=Bbo63W4xXQejQM93bxE7kHyQBKjen-StH1uCajtqcIY"
-
-# Generate SAS token valid for 169 hours
-expiry=$(date -u -d "169 hours" '+%Y-%m-%dT%H:%MZ')
-sas_token=$(az storage container generate-sas \
-    --account-name "$storage_account" \
-    --name "$container_name" \
-    --permissions rwdlac \
-    --expiry "$expiry" \
-    --https-only \
-    --output tsv)
+# Log file
+log_file="${output_dir}/upload.log"
 
 # Authenticate using managed identity
-az login --identity
+if ! az login --identity; then
+    echo "Failed to authenticate using managed identity" | tee -a "$log_file"
+    exit 1
+fi
 
-# Send SAS token to Power Automate
-curl -X POST "$power_automate_url" \
-    -H "Content-Type: application/json" \
-    -d "{\"sas_token\":\"$sas_token\"}"
+# Function to process each region
+process_region() {
+    local region=$1
+    local file_name="${output_dir}/${region}.json"
+    
+    if ! az vm list-skus --resource-type virtualMachines --location "$region" > "$file_name"; then
+        echo "Failed to list SKUs for region $region" | tee -a "$log_file"
+        return 1
+    fi
+    
+    if ! az storage blob upload --account-name "$storage_account" --container-name "$container_name" --name "${region}.json" --file "$file_name" --auth-mode login --overwrite; then
+        echo "Failed to upload blob for region $region" | tee -a "$log_file"
+        return 1
+    fi
+    
+    echo "Successfully processed region $region" | tee -a "$log_file"
+}
 
-for region in "${regions[@]}"; do
-    file_name="${output_dir}/${region}.json"
-    az vm list-skus --resource-type virtualMachines --location "$region" > "$file_name"
-    az storage blob upload --account-name "$storage_account" --container-name "$container_name" --name "${region}.json" --file "$file_name" --auth-mode login --overwrite
-done
+# Export the function and variables for parallel execution
+export -f process_region
+export output_dir storage_account container_name log_file
+
+# Process regions in parallel
+echo "Starting processing of regions..." | tee -a "$log_file"
+parallel process_region ::: "${regions[@]}"
+
+echo "All regions processed." | tee -a "$log_file"
